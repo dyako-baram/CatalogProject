@@ -1,11 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net.Mime;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Catalog.Repositories;
 using Catalog.Settings;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.HttpsPolicy;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
@@ -35,10 +39,10 @@ namespace Catalog
             BsonSerializer.RegisterSerializer(new GuidSerializer(BsonType.String));
             BsonSerializer.RegisterSerializer(new DateTimeOffsetSerializer(BsonType.String));
             
+            var mongoDbSettings=Configuration.GetSection(nameof(MongoDbSettings)).Get<MongoDbSettings>();
             services.AddSingleton<IMongoClient>(serviceProvider =>
             {
-                var settings=Configuration.GetSection(nameof(MongoDbSettings)).Get<MongoDbSettings>();
-                return new MongoClient(settings.ConnectionString);
+                return new MongoClient(mongoDbSettings.ConnectionString);
             });
             services.AddSingleton<IItemRepository,MongoDbItemRepository>();
             services.AddControllers(o=>
@@ -46,6 +50,13 @@ namespace Catalog
                 o.SuppressAsyncSuffixInActionNames=false;
             });
             services.AddSwaggerGen(c => { c.SwaggerDoc("v1", new OpenApiInfo {Title = "Catalog", Version = "v1"}); });
+            services.AddHealthChecks()
+            .AddMongoDb(
+                mongoDbSettings.ConnectionString,
+                name:"mongodb",
+                timeout:TimeSpan.FromSeconds(5),
+                tags:new []{"ready"}
+                );
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
@@ -64,7 +75,31 @@ namespace Catalog
 
             app.UseAuthorization();
 
-            app.UseEndpoints(endpoints => { endpoints.MapControllers(); });
+            app.UseEndpoints(endpoints => {
+                 endpoints.MapControllers(); 
+                 
+                 endpoints.MapHealthChecks("/health/ready",new HealthCheckOptions{
+                    Predicate=(check) =>check.Tags.Contains("ready"),
+                    ResponseWriter=async(Context,report)=>{
+                        var result=JsonSerializer.Serialize(
+                            new{
+                                status=report.Status.ToString(),
+                                 checks=report.Entries.Select(e=>new{
+                                     name=e.Key,
+                                     status=e.Value.Status.ToString(),
+                                     exception=e.Value.Exception != null ? e.Value.Exception.Message:"none",
+                                     duration = e.Value.Duration.ToString()
+                                 })
+                            }
+                        );
+                        Context.Response.ContentType=MediaTypeNames.Application.Json;
+                        await Context.Response.WriteAsync(result);
+                    }
+                 });
+                 endpoints.MapHealthChecks("/health/live",new HealthCheckOptions{
+                    Predicate=(_) =>false
+                 });
+            });
         }
     }
 }
